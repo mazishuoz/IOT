@@ -7,20 +7,25 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "freertos/semphr.h"
 
 #define TXD_PIN (GPIO_NUM_7)
 #define RXD_PIN (GPIO_NUM_6)
 
-#define UART_NUM UART_NUM_1
-#define BUF_SIZE 1024
-#define QUEUE_SIZE 10
+#define MATRIX_ROW 4 // 矩阵大小
+#define MATRIX_COL 4 // 矩阵大小
 
-QueueHandle_t data_queue;
-SemaphoreHandle_t data_queue_semaphore;
+#define UART_NUM UART_NUM_1
+
+#define BUF_SIZE 1024
+uint8_t uart_buffer[BUF_SIZE];//全局缓冲区，用于接收最新数据
+SemaphoreHandle_t buffer_mutex;
+
+uint8_t new_martix[MATRIX_ROW][MATRIX_COL];
+uint8_t temp_martix[MATRIX_ROW][MATRIX_COL];
 
 static const char *Task = "test";
+
 void initialUart() {
     const uart_config_t uart_config = {
         .baud_rate = 115200,
@@ -50,27 +55,64 @@ void send_command(const char* cmd) {
 }
 
 uint16_t unpack_uint16(const uint8_t *data) {
-    uint16_t value;
-    memcpy(&value, data, sizeof(uint16_t));
-    return value;
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
 }
 
-void copy_array_segment(const uint8_t *source, uint8_t *destination, int i, int j) {
-    if (i < 0 || j < 0 || i > j) {
+void copy_array_segment(const uint8_t *source, uint8_t *destination, int start, int end) {
+    if (start < 0 || end < 0 || start > end) {
         printf("Invalid indices\n");
         return;
     }
-    int length = j - i + 1; 
-    memcpy(destination, source + i, length);
+    int length = end - start + 1; 
+    memcpy(destination, source + start, length);
+}
+
+
+//暂定深度相机接收到的是25*25深度图
+/**
+ * depth_size是深度相机发出的深度图大小
+ * region_size是指区域大小，按照几乘以几的区域取平均
+ * 最右边一列和最下边一行舍去
+ */
+void convert_and_process_data(int depth_size, int region_size) {
+    // 提取前625个元素并转换为25x25的二维数组
+    uint8_t array_25x25[depth_size][depth_size];
+    for (int i = 0; i < depth_size; ++i) {
+        for (int j = 0; j < depth_size; ++j) {
+            array_25x25[i][j] = uart_buffer[i * depth_size + j];
+        }
+    }
+
+    // 将25x25的二维数组转换为4x4的二维数组
+    for (int i = 0; i < MATRIX_ROW; ++i) {
+        for (int j = 0; j < MATRIX_COL; ++j) {
+            float sum = 0;
+            for (int m = 0; m < region_size; ++m) {
+                for (int n = 0; n < region_size; ++n) {
+                    int row = i * region_size + m;
+                    int col = j * region_size + n;
+                    if (row < depth_size && col < depth_size) {
+                        sum += array_25x25[row][col];
+                    }
+                }
+            }
+            new_martix[i][j] = 31 - sum / (region_size * region_size * 8); // 计算平均值
+        }
+    }
+
+    // 打印4x4的二维数组
+    printf("4x4 array:\n");
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            printf("%u ", new_martix[i][j]);
+        }
+        printf("\n");
+    }
 }
 
 void process_data(const uint8_t *data, int length) {
-    uint8_t buffer[BUF_SIZE];
-    memset(buffer, 0, sizeof(buffer));
-    int buffer_len = 0;
     int start_position = -1;
     for (int i = 0; i < length - 3; ++i) {
-        buffer[buffer_len++] = data[i];
         if(data[i]==0x00 &&data[i+1]==0xff && data[i+2]==0x81 && data[i+3]==0x02){
             start_position = i;
             break;
@@ -80,7 +122,7 @@ void process_data(const uint8_t *data, int length) {
     if(start_position < 0){
         return;
     }
-    else{//找到当前的深度图
+    else{//找到当前的深度图可能的起始位置
         int dataLen = unpack_uint16(&data[start_position + 2]);//剩余数据长度   641
         // ESP_LOGI(Task, "数据包的长度为 %d :", dataLen);
         int frameLen = 2 + 2 + dataLen + 2;//该深度图数据总长
@@ -94,16 +136,11 @@ void process_data(const uint8_t *data, int length) {
         //后续考虑将代码改为自动获取数据帧的大小是几乘几
             //将从start_position+1+2+16+1是图像帧的起点
             //终点是start_position + frameLen - 2
-        // ESP_LOGI(Task, "拷贝数据长度为 %d :", (start_position + frameLen - 2)-(start_position+1+2+16+1));
-        copy_array_segment(data, buffer, start_position+1+2+16+1, start_position + frameLen - 2);
-        printf("Copied segment: ");
-        // for (int k = 0; k < (start_position + frameLen - 2)-(start_position+1+2+16+1); k++) {
-        //     printf("0x%02x ", buffer[k]);
-        // }
-        printf("\n");
-        if (xQueueSend(data_queue, buffer, portMAX_DELAY) != pdPASS) {
-            ESP_LOGE("UART", "Failed to send data to queue");
-        }
+
+        xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+        copy_array_segment(data, uart_buffer, start_position + 2 + 2 + 16, start_position + frameLen - 2);    
+        convert_and_process_data(25, 6);
+        xSemaphoreGive(buffer_mutex);
         }
     }
 }
@@ -112,53 +149,46 @@ void process_data(const uint8_t *data, int length) {
 void uart_task(void *arg) {
     uint8_t data[BUF_SIZE];
     static const char *RX_TASK_TAG = "UART_TASK";
-    int count = 0;
     while (1) {
         int len = uart_read_bytes(UART_NUM, data, BUF_SIZE, 20 / portTICK_PERIOD_MS);
         ESP_LOGI(RX_TASK_TAG, "Read %d bytes:", len);
         if (len > 0) {
-            // print_depth_data(data, len);
-            if(count == 0){
-                count = 1;
-            }else{
-                process_data(data, len);
-            }         
+            process_data(data, len);         
         }
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
 void process_task(void *arg) {
-    uint8_t frame[BUF_SIZE];
     while (1) {
-        if (xQueueReceive(data_queue, frame, portMAX_DELAY)) {
-            // 处理数据帧
-            printf("Processing frame:\n");
-            for (int i = 0; i < BUF_SIZE; ++i) {
-                printf("0x%02x ", frame[i]);
-                if ((i + 1) % 25 == 0) {
-                    printf("\n");
-                }
+        xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+        memcpy(temp_martix, new_martix, sizeof(temp_martix));
+        xSemaphoreGive(buffer_mutex);
+         // 处理数据帧
+        printf("Processing frame:\n");
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                printf("%u ", temp_martix[i][j]);
             }
             printf("\n");
         }
-        vTaskDelay(pdMS_TO_TICKS(500)); // 延迟0.1秒 
+        vTaskDelay(pdMS_TO_TICKS(1000)); // 延迟0.1秒 
     }
 }
 
-void app_main(void) {
-    initialUart();
-    send_command("AT+BINN=4\r\n");
-    send_command("AT+BAUD=2\r\n");
-    send_command("AT+FPS=10\r\n");
-    send_command("AT+DISP=4\r\n");
+// void app_main(void) {
+//     initialUart();
+//     send_command("AT+BINN=4\r\n");
+//     send_command("AT+BAUD=2\r\n");
+//     send_command("AT+FPS=1\r\n");
+//     send_command("AT+DISP=4\r\n");
 
-    data_queue = xQueueCreate(QUEUE_SIZE, BUF_SIZE);//存放队列
-    if (data_queue == NULL) {
-        ESP_LOGE(Task, "Failed to create data queue");
-        return;
-    }
-
-    xTaskCreate(uart_task, "uart_task", 4096, NULL, 10, NULL);
-    xTaskCreate(process_task, "process_task", 4096, NULL, 10, NULL);
-}
+//     buffer_mutex = xSemaphoreCreateMutex();
+//     if (buffer_mutex == NULL) {
+//         ESP_LOGE(Task, "Failed to create buffer mutex");
+//         return;
+//     }
+//     memset(new_martix, 0, sizeof(new_martix));
+//     xTaskCreate(uart_task, "uart_task", 4096, NULL, 10, NULL);
+//     xTaskCreate(process_task, "process_task", 4096, NULL, 10, NULL);
+// }

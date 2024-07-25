@@ -14,7 +14,7 @@
 
 #define FEN_CENG          4
 #define STRENGTH_LEN      32
-#define DISPLAY_LEN       21
+#define DISPLAY_LEN       1061
 
 #define TXD_PIN (GPIO_NUM_8)//定义要操作的引脚
 #define RXD_PIN (GPIO_NUM_9)
@@ -140,23 +140,9 @@ void motor_work(void* arg){//强度0-32，实现类似pwm的效果
         }
     }
     depth_count ++;
+    //或许这改为一个bool类型的变量
     while (1)
     {   
-        const int rxBytes = uart_read_bytes(UART_NUM_1, new_martix[0], RX_BUF_SIZE, 0);//读取数据
-        if (rxBytes > 0) {      //读到了数据                          
-            ESP_LOGI(RX_TASK_TAG, "Read %d bytes:", rxBytes);
-            depth_count ++;
-        }
-        // if(test_count % 5000 == 0){
-        //     ESP_LOGI(RX_TASK_TAG, "test_count: %d ", test_count);
-        //     depth_count ++;
-        //     for(int i = 0; i < MATRIX_ROW; i++){
-        //         for(int j = 0; j < MATRIX_COL; j++){
-        //             new_martix[i][j] = 0;
-        //             // new_martix[i][j] = 32 + 5 + (i + 2) * (j + 2);
-        //         }
-        //     }
-        // }
         if(count_fenceng % (STRENGTH_LEN * DISPLAY_LEN) == 0 && depth_count){//当前的图片处理完了
             if(count_fenceng != 0){
                 // depth_count --;
@@ -192,8 +178,8 @@ void motor_work(void* arg){//强度0-32，实现类似pwm的效果
                         }
                     }
                     if(count_fenceng < STRENGTH_LEN){
-                        // ROW_Data_High();    
-                        ROW_Data_Low();                   
+                        ROW_Data_High();    
+                        // ROW_Data_Low();                   
                     }else{
                         // printf("temp%d\n",temp_martix[i][j]);
                         // printf("test%d\n",fenceng[(count_fenceng -32)/ (STRENGTH_LEN * ((DISPLAY_LEN - 1) / FEN_CENG))]);
@@ -238,9 +224,9 @@ void motor_work(void* arg){//强度0-32，实现类似pwm的效果
     }
 }
 
-// void app_main(void)
-// {   
-//     initialUart();
-//     initialMotor();
-//     xTaskCreate(motor_work, "motor_task", 1024*5, NULL, 10, NULL);
-// }
+void app_main(void)
+{   
+    initialUart();
+    initialMotor();
+    xTaskCreate(motor_work, "motor_task", 1024*5, NULL, 10, NULL);
+}
